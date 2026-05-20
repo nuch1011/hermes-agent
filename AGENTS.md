@@ -8,6 +8,7 @@ Keep it lean: target **≤150 lines**. Put subsystem detail in [`docs/agent-guid
 - Hermes Agent is a Python agent framework with CLI, gateway, tools, skills, profiles, cron, Kanban, TUI, plugins, and tests.
 - Optimize for safe, profile-aware, well-tested changes with minimal prompt/context bloat.
 - If a task touches a subsystem, open the relevant reference before editing.
+- Pigasus Tech homepage context: `https://pigasus.tech`; repo `nuch1011/pigasus-homepage`; deploy path `/docker/pigasus-homepage`; service/container `pigasus-homepage`.
 - Config belongs in `~/.hermes/config.yaml`; secrets belong only in `~/.hermes/.env` or provider auth stores. Never commit secrets.
 
 ## Development environment
