@@ -113,6 +113,24 @@ def test_stale_non_stream_close_is_single_owner(monkeypatch):
     assert request_client.close_calls == 1
 
 
+def test_stale_non_stream_success_is_not_abandoned_after_timeout(monkeypatch):
+    def slow_responder(**kwargs):
+        time.sleep(2.5)
+        return {"ok": "late"}
+
+    request_client = FakeRequestClient(slow_responder)
+    factory = OpenAIFactory([request_client])
+    monkeypatch.setattr(run_agent, "OpenAI", factory)
+
+    agent = _build_agent()
+    agent._compute_non_stream_stale_timeout = lambda _messages: 0.01
+
+    result = agent._interruptible_api_call({"model": agent.model, "messages": []})
+
+    assert result == {"ok": "late"}
+    assert request_client.close_calls == 1
+
+
 def test_closed_shared_client_is_recreated_before_request(monkeypatch):
     stale_shared = FakeSharedClient(lambda **kwargs: (_ for _ in ()).throw(AssertionError("stale shared client used")))
     stale_shared._client.is_closed = True
