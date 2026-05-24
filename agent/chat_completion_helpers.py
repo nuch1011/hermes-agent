@@ -162,12 +162,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
         finally:
             _close_request_client_once("request_complete")
 
-    # ── Stale-call timeout (mirrors streaming stale detector) ────────
+    # ── Stale-call watchdog (mirrors streaming stale detector) ───────
     # Non-streaming calls return nothing until the full response is
-    # ready.  Without this, a hung provider can block for the full
-    # httpx timeout (default 1800s) with zero feedback.  The stale
-    # detector kills the connection early so the main retry loop can
-    # apply richer recovery (credential rotation, provider fallback).
+    # ready.  Report stale waits so operators see progress, but do not
+    # close the worker-local client from this watchdog thread.  Closing
+    # a transport while the provider thread is still inside httpx can
+    # leave an abandoned request running; when that late worker finally
+    # unwinds, file-descriptor reuse can corrupt unrelated local files.
     _stale_timeout = agent._compute_non_stream_stale_timeout(
         api_kwargs.get("messages", [])
     )
@@ -178,6 +179,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     t = threading.Thread(target=_call, daemon=True)
     t.start()
     _poll_count = 0
+    _stale_reported = False
     while t.is_alive():
         t.join(timeout=0.3)
         _poll_count += 1
@@ -190,41 +192,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
             )
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
+        # Stale-call watchdog: report a slow non-streaming provider once,
+        # but keep this supervising thread joined to the worker.  Do not
+        # abandon the worker and continue with a retry while its HTTP stack
+        # may still own kernel file descriptors.
         _elapsed = time.time() - _call_start
-        if _elapsed > _stale_timeout:
+        if not _stale_reported and _elapsed > _stale_timeout:
+            _stale_reported = True
             _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
             logger.warning(
                 "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
+                "model=%s context=~%s tokens. Continuing to wait safely.",
                 _elapsed, _stale_timeout,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
             agent._emit_status(
                 f"⚠️ No response from provider for {int(_elapsed)}s "
                 f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                f"Aborting call."
+                f"Continuing to wait safely."
             )
-            try:
-                if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
-                    agent._rebuild_anthropic_client()
-                else:
-                    _close_request_client_once("stale_call_kill")
-            except Exception:
-                pass
             agent._touch_activity(
-                f"stale non-streaming call killed after {int(_elapsed)}s"
+                f"stale non-streaming call still waiting after {int(_elapsed)}s"
             )
-            # Wait briefly for the thread to notice the closed connection.
-            t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
-                    f"Non-streaming API call timed out after {int(_elapsed)}s "
-                    f"with no response (threshold: {int(_stale_timeout)}s)"
-                )
-            break
 
         if agent._interrupt_requested:
             # Force-close the in-flight worker-local HTTP connection to stop
