@@ -281,6 +281,52 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 exc,
             )
             return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+        except TypeError as exc:
+            # OpenAI SDK Responses-stream parser crashes when the backend
+            # emits ``response.completed`` / ``response.incomplete`` with
+            # ``output: null`` instead of ``output: []`` (observed on
+            # chatgpt.com/backend-api/codex). The SDK iterates
+            # ``response.output`` unguarded and raises ``TypeError:
+            # 'NoneType' object is not iterable``. We have already
+            # collected the real items via ``response.output_item.done``
+            # and text via ``response.output_text.delta`` earlier in this
+            # same stream, so synthesize a final response from those.
+            # Narrowly matched so unrelated TypeErrors still surface.
+            if "'NoneType' object is not iterable" not in str(exc):
+                raise
+            logger.warning(
+                "Codex Responses stream raised TypeError from SDK parser "
+                "(response.output was None). Synthesizing final response "
+                "from %d collected item(s) / %d text delta(s). %s",
+                len(collected_output_items),
+                len(agent._codex_streamed_text_parts),
+                agent._client_log_context(),
+            )
+            if collected_output_items:
+                return SimpleNamespace(
+                    output=list(collected_output_items),
+                    output_text="".join(agent._codex_streamed_text_parts),
+                    usage=None,
+                    status="completed",
+                    incomplete_details=None,
+                )
+            if agent._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(agent._codex_streamed_text_parts)
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    output_text=assembled,
+                    usage=None,
+                    status="completed",
+                    incomplete_details=None,
+                )
+            if attempt < max_stream_retries:
+                continue
+            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
         except RuntimeError as exc:
             err_text = str(exc)
             missing_completed = "response.completed" in err_text
