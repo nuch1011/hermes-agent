@@ -64,6 +64,45 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+
+_TRANSIENT_KANBAN_SQLITE_MARKERS = (
+    "disk i/o error",
+    "database is locked",
+    "database is busy",
+    "unable to open database file",
+    "attempt to write a readonly database",
+    "readonly database",
+)
+_CORRUPT_KANBAN_SQLITE_MARKERS = (
+    "file is not a database",
+    "database disk image is malformed",
+)
+
+
+def _is_corrupt_board_db_error(exc: Exception) -> bool:
+    """Return True only for SQLite errors that mean the DB file is corrupt.
+
+    Operational failures such as ``disk I/O error`` can be caused by stale
+    deleted WAL/SHM handles or transient filesystem trouble. They must not park
+    the board in the corrupt-disabled set because the main DB may be healthy and
+    the next tick with a fresh connection can recover.
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CORRUPT_KANBAN_SQLITE_MARKERS)
+
+
+def _is_transient_kanban_sqlite_error(exc: Exception) -> bool:
+    """Return True for retryable SQLite operational errors."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    if _is_corrupt_board_db_error(exc):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_KANBAN_SQLITE_MARKERS)
+
+
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -5129,15 +5168,6 @@ class GatewayRunner:
                 return (resolved, None, None)
             return (resolved, stat.st_mtime_ns, stat.st_size)
 
-        def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
-            msg = str(exc).lower()
-            return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
-            )
-
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
@@ -5179,15 +5209,42 @@ class GatewayRunner:
                     disabled_corrupt_boards[slug] = fingerprint
                     logger.error(
                         "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; disabling dispatch for this board "
+                        "SQLite database (%s); disabling dispatch for this board "
                         "until the file changes or the gateway restarts. Move "
                         "or restore the file, then run `hermes kanban init` if "
                         "you need a fresh board.",
                         slug,
                         fingerprint[0],
+                        exc,
                     )
                     return None
-                logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                if _is_transient_kanban_sqlite_error(exc):
+                    stale_sidecars = []
+                    try:
+                        stale_sidecars = _kb.deleted_wal_sidecar_fds(_kb.kanban_db_path(slug))
+                    except Exception:
+                        stale_sidecars = []
+                    if stale_sidecars:
+                        stale_summary = ", ".join(
+                            f"fd={entry['fd']}:{entry['suffix']}" for entry in stale_sidecars
+                        )
+                        logger.warning(
+                            "kanban dispatcher: transient SQLite error on board %s (%s); "
+                            "deleted WAL/SHM sidecar FDs are still open in this process: %s. "
+                            "The tick connection will be closed and the next tick will reopen it.",
+                            slug,
+                            exc,
+                            stale_summary,
+                        )
+                    else:
+                        logger.warning(
+                            "kanban dispatcher: transient SQLite error on board %s (%s); "
+                            "the tick connection will be closed and retried on the next tick",
+                            slug,
+                            exc,
+                        )
+                    return None
+                logger.exception("kanban dispatcher: tick failed on board %s: %s", slug, exc)
                 return None
             except Exception:
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
