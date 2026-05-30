@@ -25,6 +25,42 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _codex_auto_approve_enabled() -> bool:
+    """Return True when Hermes approval-bypass should apply to Codex too.
+
+    Codex app-server asks for command/file approvals through a separate
+    server-request channel. Without this bridge, `approvals.mode: off` or
+    `/yolo` suppresses Hermes terminal prompts but Codex still asks the user.
+    """
+    try:
+        from utils import is_truthy_value
+
+        if is_truthy_value(os.getenv("HERMES_YOLO_MODE")):
+            return True
+    except Exception:
+        pass
+
+    try:
+        from tools.approval import is_current_session_yolo_enabled
+
+        if is_current_session_yolo_enabled():
+            return True
+    except Exception:
+        pass
+
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        mode = cfg_get(load_config(), "approvals", "mode", default="manual")
+        if isinstance(mode, bool):
+            return mode is False
+        if isinstance(mode, str):
+            return mode.strip().lower() in {"off", "yolo"}
+    except Exception:
+        return False
+    return False
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -56,9 +92,24 @@ def run_codex_app_server_turn(
             approval_callback = _get_approval_callback()
         except Exception:
             approval_callback = None
+
+        # Codex app-server has its own approval surface for shell/file-change
+        # requests. Mirror Hermes' yolo/off settings there so gateway sessions
+        # do not keep prompting after the user configured approval bypass.
+        auto_approve = _codex_auto_approve_enabled()
+        routing = None
+        if auto_approve:
+            from agent.transports.codex_app_server_session import _ServerRequestRouting
+
+            routing = _ServerRequestRouting(
+                auto_approve_exec=True,
+                auto_approve_apply_patch=True,
+            )
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
+            request_routing=routing,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
