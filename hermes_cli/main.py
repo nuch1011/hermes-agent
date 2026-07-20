@@ -132,7 +132,7 @@ def _cleanup_oneshot_runtime() -> None:
         pass
     try:
         from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
+        shutdown_mcp_servers(final=True)
     except BaseException:
         pass
     try:
