@@ -351,6 +351,7 @@ def test_termux_fast_cli_launch_bare_defers_agent_startup(monkeypatch, main_mod)
 
 
 def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod):
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
     captured = {}
     prepared = []
 
@@ -583,6 +584,7 @@ def test_read_git_revision_fingerprint_unresolved_ref_is_stable(tmp_path, main_m
 
 
 def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
     captured = {}
 
     import hermes_cli.config as config_mod
@@ -773,6 +775,7 @@ def test_exit_after_oneshot_normalizes_non_int_exit_code(monkeypatch, main_mod):
 
 
 def test_run_and_exit_oneshot_routes_system_exit_to_hard_exit(monkeypatch, main_mod):
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
     exits = []
 
     def fake_run_oneshot(*_args, **_kwargs):
@@ -793,6 +796,7 @@ def test_run_and_exit_oneshot_routes_system_exit_to_hard_exit(monkeypatch, main_
 def test_run_and_exit_oneshot_prints_system_exit_message(
     monkeypatch, capsys, main_mod
 ):
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
     exits = []
 
     def fake_run_oneshot(*_args, **_kwargs):
@@ -918,6 +922,7 @@ def test_run_and_exit_oneshot_still_exits_when_global_cleanup_raises(
 def test_run_and_exit_oneshot_routes_keyboard_interrupt_to_130(
     monkeypatch, main_mod
 ):
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
     exits = []
 
     def fake_run_oneshot(*_args, **_kwargs):
