@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+import cli as cli_module
 from hermes_cli import kanban_db as kb
 from hermes_cli import goals
 
@@ -128,6 +129,7 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
         pid = 4242
 
     def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
         captured["env"] = kwargs.get("env", {})
         return _FakeProc()
 
@@ -147,6 +149,7 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_GOAL_MODE") == "1"
     assert env.get("HERMES_KANBAN_GOAL_MAX_TURNS") == "5"
+    assert captured["cmd"].index("-Q") > captured["cmd"].index("chat")
 
 
 def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
@@ -156,6 +159,7 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
         pid = 4243
 
     def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
         captured["env"] = kwargs.get("env", {})
         return _FakeProc()
 
@@ -169,6 +173,59 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
     env = captured["env"]
     assert "HERMES_KANBAN_GOAL_MODE" not in env
     assert "HERMES_KANBAN_GOAL_MAX_TURNS" not in env
+    assert "-Q" not in captured["cmd"]
+
+
+def test_single_query_exit_code_preserves_kanban_provider_failures(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert cli_module._single_query_exit_code(
+        {"failed": True, "failure_reason": "billing"}
+    ) == 1
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+    assert cli_module._single_query_exit_code({"failed": False}) == 0
+    assert cli_module._single_query_exit_code({"failed": True}) == 1
+    assert cli_module._single_query_exit_code(
+        {"failed": True, "failure_reason": "rate_limit"}
+    ) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert cli_module._single_query_exit_code(
+        {"failed": True, "failure_reason": "billing"}
+    ) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="provider failure",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: ("continue", "not done", False, None),
+    )
+
+    class _Agent:
+        session_id = "session"
+
+        def run_conversation(self, **_kwargs):
+            return {"failed": True, "failure_reason": "billing"}
+
+    class _CLI:
+        agent = _Agent()
+        conversation_history = []
+        session_id = "session"
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module._run_kanban_goal_loop_q(_CLI(), "first response")
+    assert exc_info.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
 
 
 # ---------------------------------------------------------------------------

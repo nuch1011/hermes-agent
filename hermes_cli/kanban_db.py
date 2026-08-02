@@ -7795,6 +7795,10 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    if task.goal_mode:
+        # Goal-mode workers must take the fully-quiet single-query path:
+        # the kanban goal-loop hook only runs in cli.py's quiet branch.
+        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
