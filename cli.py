@@ -15693,7 +15693,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         failure_reason = type(exc).__name__
         logger.exception("kanban goal loop failed")
 
-    if _task_status() in ("running", "ready"):
+    # Only mutate the task while this worker still owns the running claim. A
+    # different state means the task was completed, blocked, archived, or
+    # reclaimed externally and must not be overwritten by this stale worker.
+    if _task_status() == "running":
         _block(f"Goal-mode lifecycle failed: {failure_reason}")
 
 

@@ -271,6 +271,43 @@ def test_goal_loop_failures_block_open_task(kanban_home, monkeypatch, failure_si
     assert task.status == "blocked"
 
 
+def test_goal_loop_does_not_block_reclaimed_task(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="reclaimed goal task",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    def _reclaim_then_return(**_kwargs):
+        with kb.connect() as conn, kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', worker_pid = NULL WHERE id = ?",
+                (tid,),
+            )
+        return {"reason": "task status changed"}
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _reclaim_then_return)
+
+    class _CLI:
+        agent = None
+        conversation_history = []
+        session_id = "session"
+
+    cli_module._run_kanban_goal_loop_q(
+        _CLI(), "first response"  # type: ignore[arg-type]
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "ready"
+
+
 def test_quiet_goal_mode_main_blocks_after_loop_failure(kanban_home, monkeypatch):
     with kb.connect() as conn:
         tid = kb.create_task(
