@@ -15605,7 +15605,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
-        return
+        raise RuntimeError("goal_mode worker is missing HERMES_KANBAN_TASK")
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -15621,7 +15621,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         except Exception:
             pass
     if task is None:
-        return
+        raise RuntimeError(f"goal_mode task {task_id} was not found")
 
     goal_parts = [task.title or ""]
     if task.body:
@@ -15651,11 +15651,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             print(resp)
         return resp or ""
 
-    def _task_status() -> "str | None":
+    def _task_status() -> str:
         c = _kb.connect()
         try:
             t = _kb.get_task(c, task_id)
-            return t.status if t is not None else None
+            if t is None:
+                raise RuntimeError(f"goal_mode task {task_id} disappeared")
+            return t.status
         finally:
             try:
                 c.close()
@@ -15665,7 +15667,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            if not _kb.block_task(c, task_id, reason=reason):
+                raise RuntimeError(f"could not block goal_mode task {task_id}")
         finally:
             try:
                 c.close()
@@ -15693,10 +15696,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         failure_reason = type(exc).__name__
         logger.exception("kanban goal loop failed")
 
-    # Only mutate the task while this worker still owns the running claim. A
-    # different state means the task was completed, blocked, archived, or
-    # reclaimed externally and must not be overwritten by this stale worker.
-    if _task_status() == "running":
+    if _task_status() in ("running", "ready"):
         _block(f"Goal-mode lifecycle failed: {failure_reason}")
 
 

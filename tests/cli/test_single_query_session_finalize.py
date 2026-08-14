@@ -200,7 +200,13 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
     ]
 
 
-def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
+@pytest.mark.parametrize(
+    ("failure_reason", "expected_exit"),
+    [(None, 1), ("billing", 75), ("rate_limit", 75)],
+)
+def test_quiet_single_query_main_finalizes_while_preserving_exit_code(
+    monkeypatch, failure_reason, expected_exit
+):
     calls = []
 
     import cli as cli_mod
@@ -211,6 +217,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             "final_response": "",
             "error": "provider failed",
             "failed": True,
+            "failure_reason": failure_reason,
         }
 
     class FakeCLI:
@@ -251,7 +258,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             calls.append(("init", kwargs))
             return True
 
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
     monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
@@ -264,7 +271,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     with pytest.raises(SystemExit) as exc_info:
         cli_mod.main(query="hello", quiet=True, toolsets="terminal")
 
-    assert exc_info.value.code == 1
+    assert exc_info.value.code == expected_exit
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")

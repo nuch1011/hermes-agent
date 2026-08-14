@@ -193,8 +193,16 @@ def test_single_query_exit_code_preserves_kanban_provider_failures(monkeypatch):
     ) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
 
 
+@pytest.mark.parametrize(
+    ("failure_reason", "expected_exit"),
+    [
+        ("billing", kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        ("rate_limit", kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        ("provider_error", 1),
+    ],
+)
 def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
-    kanban_home, monkeypatch
+    kanban_home, monkeypatch, failure_reason, expected_exit
 ):
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -216,7 +224,7 @@ def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
         session_id = "session"
 
         def run_conversation(self, **_kwargs):
-            return {"failed": True, "failure_reason": "billing"}
+            return {"failed": True, "failure_reason": failure_reason}
 
     class _CLI:
         agent = _Agent()
@@ -227,7 +235,12 @@ def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
         cli_module._run_kanban_goal_loop_q(
             _CLI(), "first response"  # type: ignore[arg-type]
         )
-    assert exc_info.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert exc_info.value.code == expected_exit
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
 
 
 @pytest.mark.parametrize("failure_site", ["judge", "continuation"])
@@ -271,7 +284,7 @@ def test_goal_loop_failures_block_open_task(kanban_home, monkeypatch, failure_si
     assert task.status == "blocked"
 
 
-def test_goal_loop_does_not_block_reclaimed_task(kanban_home, monkeypatch):
+def test_goal_loop_blocks_requeued_task_before_clean_exit(kanban_home, monkeypatch):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
@@ -305,18 +318,92 @@ def test_goal_loop_does_not_block_reclaimed_task(kanban_home, monkeypatch):
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
     assert task is not None
-    assert task.status == "ready"
+    assert task.status == "blocked"
 
 
-def test_quiet_goal_mode_main_blocks_after_loop_failure(kanban_home, monkeypatch):
+def test_goal_loop_requires_task_id(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    with pytest.raises(RuntimeError, match="missing HERMES_KANBAN_TASK"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+
+def test_goal_loop_rejects_missing_task(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_goal_task")
+
+    with pytest.raises(RuntimeError, match="was not found"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+
+def test_goal_loop_rejects_missing_final_task(kanban_home, monkeypatch):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
-            title="quiet goal loop failure",
+            title="disappearing goal task",
             assignee="default",
             goal_mode=True,
         )
         kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+    assert task is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setattr(
+        goals,
+        "run_kanban_goal_loop",
+        lambda **_kwargs: {"reason": "loop returned"},
+    )
+    original_get_task = kb.get_task
+    calls = 0
+
+    def _get_task(conn, task_id):
+        nonlocal calls
+        calls += 1
+        return original_get_task(conn, task_id) if calls == 1 else None
+
+    monkeypatch.setattr(kb, "get_task", _get_task)
+
+    with pytest.raises(RuntimeError, match="disappeared"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+
+def test_goal_loop_rejects_failed_block_transition(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="unblockable goal task",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setattr(
+        goals,
+        "run_kanban_goal_loop",
+        lambda **_kwargs: {"reason": "loop returned"},
+    )
+    monkeypatch.setattr(kb, "block_task", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="could not block"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("task_exists", [True, False])
+def test_quiet_goal_mode_main_signals_loop_failure(
+    kanban_home, monkeypatch, task_exists
+):
+    if task_exists:
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="quiet goal loop failure",
+                assignee="default",
+                goal_mode=True,
+            )
+            kb.claim_task(conn, tid)
+    else:
+        tid = "t_missing_goal_task"
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
@@ -371,12 +458,13 @@ def test_quiet_goal_mode_main_blocks_after_loop_failure(kanban_home, monkeypatch
 
     with pytest.raises(SystemExit) as exc_info:
         cli_module.main(query="work task", quiet=True, toolsets="kanban")
-    assert exc_info.value.code == 0
+    assert exc_info.value.code == (0 if task_exists else 1)
 
-    with kb.connect() as conn:
-        task = kb.get_task(conn, tid)
-    assert task is not None
-    assert task.status == "blocked"
+    if task_exists:
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
 
 
 # ---------------------------------------------------------------------------
