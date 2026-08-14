@@ -224,8 +224,122 @@ def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
         session_id = "session"
 
     with pytest.raises(SystemExit) as exc_info:
-        cli_module._run_kanban_goal_loop_q(_CLI(), "first response")
+        cli_module._run_kanban_goal_loop_q(
+            _CLI(), "first response"  # type: ignore[arg-type]
+        )
     assert exc_info.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+@pytest.mark.parametrize("failure_site", ["judge", "continuation"])
+def test_goal_loop_failures_block_open_task(kanban_home, monkeypatch, failure_site):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="goal loop failure",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    def _judge(*_args, **_kwargs):
+        if failure_site == "judge":
+            raise RuntimeError("judge failed")
+        return "continue", "not done", False, None
+
+    monkeypatch.setattr(goals, "judge_goal", _judge)
+
+    class _Agent:
+        session_id = "session"
+
+        def run_conversation(self, **_kwargs):
+            raise RuntimeError("continuation failed")
+
+    class _CLI:
+        agent = _Agent()
+        conversation_history = []
+        session_id = "session"
+
+    cli_module._run_kanban_goal_loop_q(
+        _CLI(), "first response"  # type: ignore[arg-type]
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "blocked"
+
+
+def test_quiet_goal_mode_main_blocks_after_loop_failure(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="quiet goal loop failure",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("judge failed")),
+    )
+
+    class _CLI:
+        provider = "test-provider"
+        model = "test-model"
+        session_id = "session"
+        conversation_history = []
+        _active_agent_route_signature = "same-route"
+        agent = type(
+            "Agent",
+            (),
+            {
+                "session_id": "session",
+                "quiet_mode": False,
+                "suppress_status_output": False,
+                "stream_delta_callback": None,
+                "tool_gen_callback": None,
+                "run_conversation": lambda self, **_kwargs: {"final_response": "started"},
+            },
+        )()
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def _claim_active_session(self, *_args, **_kwargs):
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return True
+
+    monkeypatch.setattr(cli_module, "HermesCLI", _CLI)
+    monkeypatch.setattr(cli_module.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_module, "_finalize_single_query", lambda _cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module.main(query="work task", quiet=True, toolsets="kanban")
+    assert exc_info.value.code == 0
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "blocked"
 
 
 # ---------------------------------------------------------------------------
