@@ -15592,21 +15592,12 @@ def _single_query_exit_code(result: Any) -> int:
     return 1
 
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
-    """Drive a kanban goal_mode worker through the Ralph-style goal loop.
-
-    Called from the quiet single-query path AFTER the worker's first turn,
-    only when ``HERMES_KANBAN_GOAL_MODE`` is set (dispatcher-spawned
-    goal_mode card). Wires the worker's ``run_conversation`` and the kanban
-    DB into ``goals.run_kanban_goal_loop``. A failed loop blocks a still-open
-    task so the worker cannot exit cleanly without a lifecycle signal.
-    """
-    import os as _os
-
-    task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+def _require_kanban_goal_run_q() -> tuple[Any, int]:
+    """Return the task and positive run id for the current quiet goal run."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         raise RuntimeError("goal_mode worker is missing HERMES_KANBAN_TASK")
-    raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
     try:
         run_id = int(raw_run_id)
     except ValueError as exc:
@@ -15617,23 +15608,36 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         raise RuntimeError(
             "goal_mode worker requires a positive HERMES_KANBAN_RUN_ID"
         )
+    from hermes_cli import kanban_db as _kb
 
+    with _kb.connect() as conn:
+        task = _kb.get_task(conn, task_id)
+    if task is None:
+        raise RuntimeError(f"goal_mode task {task_id} was not found")
+    if task.current_run_id != run_id or task.status not in ("running", "ready"):
+        raise RuntimeError(
+            f"goal_mode run {run_id} is no longer current for task {task_id}"
+        )
+    return task, run_id
+
+
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+    """Drive a kanban goal_mode worker through the Ralph-style goal loop.
+
+    Called from the quiet single-query path AFTER the worker's first turn,
+    only when ``HERMES_KANBAN_GOAL_MODE`` is set (dispatcher-spawned
+    goal_mode card). Wires the worker's ``run_conversation`` and the kanban
+    DB into ``goals.run_kanban_goal_loop``. A failed loop blocks a still-open
+    task so the worker cannot exit cleanly without a lifecycle signal.
+    """
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
 
+    task, run_id = _require_kanban_goal_run_q()
+    task_id = task.id
+
     # Resolve goal text from the card (title + body = the acceptance
     # criteria the judge evaluates against).
-    conn = _kb.connect()
-    try:
-        task = _kb.get_task(conn, task_id)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    if task is None:
-        raise RuntimeError(f"goal_mode task {task_id} was not found")
-
     goal_parts = [task.title or ""]
     if task.body:
         goal_parts.append(task.body)
@@ -16120,6 +16124,13 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                            try:
+                                _require_kanban_goal_run_q()
+                            except RuntimeError as _goal_exc:
+                                logger.debug("kanban goal preflight failed: %s", _goal_exc)
+                                print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                                sys.exit(1)
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,

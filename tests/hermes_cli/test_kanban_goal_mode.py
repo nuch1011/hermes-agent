@@ -563,6 +563,105 @@ def test_quiet_goal_mode_main_signals_loop_failure(
         assert task.status == "blocked"
 
 
+@pytest.mark.parametrize("mutation", ["complete", "block"])
+@pytest.mark.parametrize("raw_run_id", [None, "not-an-int", "stale"])
+def test_quiet_goal_mode_rejects_invalid_run_id_before_first_turn(
+    kanban_home, monkeypatch, mutation, raw_run_id
+):
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="guard the first turn",
+            assignee="default",
+            goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+
+    assert claimed is not None
+    stale_run_id = claimed.current_run_id
+    if raw_run_id == "stale":
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        with kb.connect() as conn:
+            kb._set_worker_pid(conn, tid, 98765)
+            assert kb.detect_crashed_workers(conn) == [tid]
+            claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    if raw_run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    elif raw_run_id == "stale":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(stale_run_id))
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", raw_run_id)
+    monkeypatch.setattr(kt, "_goal_judge_available", lambda: False)
+    turns = []
+
+    class _Agent:
+        session_id = "session"
+        quiet_mode = False
+        suppress_status_output = False
+        stream_delta_callback = None
+        tool_gen_callback = None
+
+        def run_conversation(self, **_kwargs):
+            turns.append("first")
+            if mutation == "complete":
+                kt._handle_complete({"summary": "stale completion"})
+            else:
+                kt._handle_block(
+                    {"reason": "stale block", "kind": "needs_input"}
+                )
+            return {"final_response": "started"}
+
+    class _CLI:
+        provider = "test-provider"
+        model = "test-model"
+        session_id = "session"
+        conversation_history = []
+        _active_agent_route_signature = "same-route"
+        agent = _Agent()
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def _claim_active_session(self, *_args, **_kwargs):
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return True
+
+    monkeypatch.setattr(cli_module, "HermesCLI", _CLI)
+    monkeypatch.setattr(cli_module.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_module, "_finalize_single_query", lambda _cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module.main(query="work task", quiet=True, toolsets="kanban")
+    assert exc_info.value.code == 1
+    assert turns == []
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+
+
 # ---------------------------------------------------------------------------
 # Goal loop logic (callback-injected, no live model)
 # ---------------------------------------------------------------------------
