@@ -15606,6 +15606,17 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         raise RuntimeError("goal_mode worker is missing HERMES_KANBAN_TASK")
+    raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        run_id = int(raw_run_id)
+    except ValueError as exc:
+        raise RuntimeError(
+            "goal_mode worker requires a positive HERMES_KANBAN_RUN_ID"
+        ) from exc
+    if run_id <= 0:
+        raise RuntimeError(
+            "goal_mode worker requires a positive HERMES_KANBAN_RUN_ID"
+        )
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -15667,7 +15678,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            if not _kb.block_task(c, task_id, reason=reason):
+            if not _kb.block_task(
+                c,
+                task_id,
+                reason=reason,
+                expected_run_id=run_id,
+            ):
                 raise RuntimeError(f"could not block goal_mode task {task_id}")
         finally:
             try:
