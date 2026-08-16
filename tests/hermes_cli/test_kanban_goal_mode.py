@@ -211,9 +211,11 @@ def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
             assignee="default",
             goal_mode=True,
         )
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
 
+    assert claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     monkeypatch.setattr(
         goals,
         "judge_goal",
@@ -252,9 +254,11 @@ def test_goal_loop_failures_block_open_task(kanban_home, monkeypatch, failure_si
             assignee="default",
             goal_mode=True,
         )
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
 
+    assert claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
     def _judge(*_args, **_kwargs):
         if failure_site == "judge":
@@ -284,19 +288,21 @@ def test_goal_loop_failures_block_open_task(kanban_home, monkeypatch, failure_si
     assert task.status == "blocked"
 
 
-def test_goal_loop_blocks_requeued_task_before_clean_exit(kanban_home, monkeypatch):
+def test_goal_loop_blocks_requeued_same_run_before_clean_exit(kanban_home, monkeypatch):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
-            title="reclaimed goal task",
+            title="requeued goal task",
             assignee="default",
             goal_mode=True,
         )
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
 
+    assert claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
-    def _reclaim_then_return(**_kwargs):
+    def _requeue_then_return(**_kwargs):
         with kb.connect() as conn, kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status = 'ready', worker_pid = NULL WHERE id = ?",
@@ -304,7 +310,7 @@ def test_goal_loop_blocks_requeued_task_before_clean_exit(kanban_home, monkeypat
             )
         return {"reason": "task status changed"}
 
-    monkeypatch.setattr(goals, "run_kanban_goal_loop", _reclaim_then_return)
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _requeue_then_return)
 
     class _CLI:
         agent = None
@@ -321,6 +327,86 @@ def test_goal_loop_blocks_requeued_task_before_clean_exit(kanban_home, monkeypat
     assert task.status == "blocked"
 
 
+def test_goal_loop_stale_run_cannot_block_reclaimed_task(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="reclaimed goal task",
+            assignee="default",
+            goal_mode=True,
+        )
+        run1 = kb.claim_task(conn, tid)
+
+    assert run1 is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run1.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    runs = {}
+
+    def _reclaim_then_return(**_kwargs):
+        with kb.connect() as conn:
+            kb._set_worker_pid(conn, tid, 98765)
+            assert kb.detect_crashed_workers(conn) == [tid]
+            run2 = kb.claim_task(conn, tid)
+            assert run2 is not None
+            runs["run2"] = run2.current_run_id
+        return {"reason": "task status changed"}
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _reclaim_then_return)
+
+    class _CLI:
+        agent = None
+        conversation_history = []
+        session_id = "session"
+
+    with pytest.raises(RuntimeError, match="could not block"):
+        cli_module._run_kanban_goal_loop_q(
+            _CLI(), "first response"  # type: ignore[arg-type]
+        )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == runs["run2"]
+
+
+@pytest.mark.parametrize("raw_run_id", [None, "", "not-an-int", "0", "-1"])
+def test_goal_loop_rejects_missing_or_invalid_run_id(
+    kanban_home, monkeypatch, raw_run_id
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="run-scoped goal task",
+            assignee="default",
+            goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, tid)
+
+    assert claimed is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    if raw_run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", raw_run_id)
+    monkeypatch.setattr(
+        goals,
+        "run_kanban_goal_loop",
+        lambda **_kwargs: {"reason": "loop returned"},
+    )
+
+    with pytest.raises(RuntimeError, match="HERMES_KANBAN_RUN_ID"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == claimed.current_run_id
+
+
 def test_goal_loop_requires_task_id(monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
 
@@ -330,6 +416,7 @@ def test_goal_loop_requires_task_id(monkeypatch):
 
 def test_goal_loop_rejects_missing_task(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_goal_task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
 
     with pytest.raises(RuntimeError, match="was not found"):
         cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
@@ -343,11 +430,13 @@ def test_goal_loop_rejects_missing_final_task(kanban_home, monkeypatch):
             assignee="default",
             goal_mode=True,
         )
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
         task = kb.get_task(conn, tid)
     assert task is not None
+    assert claimed is not None
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     monkeypatch.setattr(
         goals,
         "run_kanban_goal_loop",
@@ -375,9 +464,11 @@ def test_goal_loop_rejects_failed_block_transition(kanban_home, monkeypatch):
             assignee="default",
             goal_mode=True,
         )
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
 
+    assert claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     monkeypatch.setattr(
         goals,
         "run_kanban_goal_loop",
@@ -401,11 +492,16 @@ def test_quiet_goal_mode_main_signals_loop_failure(
                 assignee="default",
                 goal_mode=True,
             )
-            kb.claim_task(conn, tid)
+            claimed = kb.claim_task(conn, tid)
     else:
         tid = "t_missing_goal_task"
+        claimed = None
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv(
+        "HERMES_KANBAN_RUN_ID",
+        str(claimed.current_run_id if claimed is not None else 1),
+    )
     monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
     monkeypatch.setattr(
         goals,
