@@ -15598,15 +15598,14 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     Called from the quiet single-query path AFTER the worker's first turn,
     only when ``HERMES_KANBAN_GOAL_MODE`` is set (dispatcher-spawned
     goal_mode card). Wires the worker's ``run_conversation`` and the kanban
-    DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
-    caller — a broken goal loop must never wedge a worker, the dispatcher's
-    claim TTL / crash detection is the backstop.
+    DB into ``goals.run_kanban_goal_loop``. A failed loop blocks a still-open
+    task so the worker cannot exit cleanly without a lifecycle signal.
     """
     import os as _os
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
-        return
+        raise RuntimeError("goal_mode worker is missing HERMES_KANBAN_TASK")
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -15622,14 +15621,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         except Exception:
             pass
     if task is None:
-        return
+        raise RuntimeError(f"goal_mode task {task_id} was not found")
 
     goal_parts = [task.title or ""]
     if task.body:
         goal_parts.append(task.body)
     goal_text = "\n\n".join(p for p in goal_parts if p).strip()
-    if not goal_text:
-        return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
@@ -15654,11 +15651,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             print(resp)
         return resp or ""
 
-    def _task_status() -> "str | None":
+    def _task_status() -> str:
         c = _kb.connect()
         try:
             t = _kb.get_task(c, task_id)
-            return t.status if t is not None else None
+            if t is None:
+                raise RuntimeError(f"goal_mode task {task_id} disappeared")
+            return t.status
         finally:
             try:
                 c.close()
@@ -15668,23 +15667,37 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            if not _kb.block_task(c, task_id, reason=reason):
+                raise RuntimeError(f"could not block goal_mode task {task_id}")
         finally:
             try:
                 c.close()
             except Exception:
                 pass
 
-    _run_loop(
-        task_id=task_id,
-        goal_text=goal_text,
-        run_turn=_run_turn,
-        task_status_fn=_task_status,
-        block_fn=_block,
-        max_turns=max_turns,
-        first_response=first_response or "",
-        log=lambda m: logger.info("%s", m),
-    )
+    if not goal_text:
+        _block("Goal-mode lifecycle failed: task has no goal text")
+        return
+
+    failure_reason = "goal loop returned without a terminal task state"
+    try:
+        result = _run_loop(
+            task_id=task_id,
+            goal_text=goal_text,
+            run_turn=_run_turn,
+            task_status_fn=_task_status,
+            block_fn=_block,
+            max_turns=max_turns,
+            first_response=first_response or "",
+            log=lambda m: logger.info("%s", m),
+        )
+        failure_reason = str(result.get("reason") or failure_reason)
+    except Exception as exc:
+        failure_reason = type(exc).__name__
+        logger.exception("kanban goal loop failed")
+
+    if _task_status() in ("running", "ready"):
+        _block(f"Goal-mode lifecycle failed: {failure_reason}")
 
 
 def main(
@@ -16140,6 +16153,7 @@ def main(
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+                                exit_code = 1
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)

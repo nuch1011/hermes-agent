@@ -193,8 +193,16 @@ def test_single_query_exit_code_preserves_kanban_provider_failures(monkeypatch):
     ) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
 
 
+@pytest.mark.parametrize(
+    ("failure_reason", "expected_exit"),
+    [
+        ("billing", kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        ("rate_limit", kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        ("provider_error", 1),
+    ],
+)
 def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
-    kanban_home, monkeypatch
+    kanban_home, monkeypatch, failure_reason, expected_exit
 ):
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -216,7 +224,7 @@ def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
         session_id = "session"
 
         def run_conversation(self, **_kwargs):
-            return {"failed": True, "failure_reason": "billing"}
+            return {"failed": True, "failure_reason": failure_reason}
 
     class _CLI:
         agent = _Agent()
@@ -224,8 +232,239 @@ def test_goal_loop_provider_failure_exits_for_dispatcher_requeue(
         session_id = "session"
 
     with pytest.raises(SystemExit) as exc_info:
-        cli_module._run_kanban_goal_loop_q(_CLI(), "first response")
-    assert exc_info.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        cli_module._run_kanban_goal_loop_q(
+            _CLI(), "first response"  # type: ignore[arg-type]
+        )
+    assert exc_info.value.code == expected_exit
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+
+
+@pytest.mark.parametrize("failure_site", ["judge", "continuation"])
+def test_goal_loop_failures_block_open_task(kanban_home, monkeypatch, failure_site):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="goal loop failure",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    def _judge(*_args, **_kwargs):
+        if failure_site == "judge":
+            raise RuntimeError("judge failed")
+        return "continue", "not done", False, None
+
+    monkeypatch.setattr(goals, "judge_goal", _judge)
+
+    class _Agent:
+        session_id = "session"
+
+        def run_conversation(self, **_kwargs):
+            raise RuntimeError("continuation failed")
+
+    class _CLI:
+        agent = _Agent()
+        conversation_history = []
+        session_id = "session"
+
+    cli_module._run_kanban_goal_loop_q(
+        _CLI(), "first response"  # type: ignore[arg-type]
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "blocked"
+
+
+def test_goal_loop_blocks_requeued_task_before_clean_exit(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="reclaimed goal task",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    def _reclaim_then_return(**_kwargs):
+        with kb.connect() as conn, kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', worker_pid = NULL WHERE id = ?",
+                (tid,),
+            )
+        return {"reason": "task status changed"}
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _reclaim_then_return)
+
+    class _CLI:
+        agent = None
+        conversation_history = []
+        session_id = "session"
+
+    cli_module._run_kanban_goal_loop_q(
+        _CLI(), "first response"  # type: ignore[arg-type]
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "blocked"
+
+
+def test_goal_loop_requires_task_id(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    with pytest.raises(RuntimeError, match="missing HERMES_KANBAN_TASK"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+
+def test_goal_loop_rejects_missing_task(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_goal_task")
+
+    with pytest.raises(RuntimeError, match="was not found"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+
+def test_goal_loop_rejects_missing_final_task(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="disappearing goal task",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+    assert task is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setattr(
+        goals,
+        "run_kanban_goal_loop",
+        lambda **_kwargs: {"reason": "loop returned"},
+    )
+    original_get_task = kb.get_task
+    calls = 0
+
+    def _get_task(conn, task_id):
+        nonlocal calls
+        calls += 1
+        return original_get_task(conn, task_id) if calls == 1 else None
+
+    monkeypatch.setattr(kb, "get_task", _get_task)
+
+    with pytest.raises(RuntimeError, match="disappeared"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+
+def test_goal_loop_rejects_failed_block_transition(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="unblockable goal task",
+            assignee="default",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setattr(
+        goals,
+        "run_kanban_goal_loop",
+        lambda **_kwargs: {"reason": "loop returned"},
+    )
+    monkeypatch.setattr(kb, "block_task", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="could not block"):
+        cli_module._run_kanban_goal_loop_q(None, "first response")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("task_exists", [True, False])
+def test_quiet_goal_mode_main_signals_loop_failure(
+    kanban_home, monkeypatch, task_exists
+):
+    if task_exists:
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="quiet goal loop failure",
+                assignee="default",
+                goal_mode=True,
+            )
+            kb.claim_task(conn, tid)
+    else:
+        tid = "t_missing_goal_task"
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("judge failed")),
+    )
+
+    class _CLI:
+        provider = "test-provider"
+        model = "test-model"
+        session_id = "session"
+        conversation_history = []
+        _active_agent_route_signature = "same-route"
+        agent = type(
+            "Agent",
+            (),
+            {
+                "session_id": "session",
+                "quiet_mode": False,
+                "suppress_status_output": False,
+                "stream_delta_callback": None,
+                "tool_gen_callback": None,
+                "run_conversation": lambda self, **_kwargs: {"final_response": "started"},
+            },
+        )()
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def _claim_active_session(self, *_args, **_kwargs):
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return True
+
+    monkeypatch.setattr(cli_module, "HermesCLI", _CLI)
+    monkeypatch.setattr(cli_module.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_module, "_finalize_single_query", lambda _cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module.main(query="work task", quiet=True, toolsets="kanban")
+    assert exc_info.value.code == (0 if task_exists else 1)
+
+    if task_exists:
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
 
 
 # ---------------------------------------------------------------------------
