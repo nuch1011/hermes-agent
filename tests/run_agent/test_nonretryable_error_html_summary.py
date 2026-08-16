@@ -128,3 +128,25 @@ def test_non_retryable_failure_error_is_summarized_not_raw_html():
     # The original page was tens of kilobytes; a summary is short.
     assert len(error) < 500
     assert len(error) < len(_CLOUDFLARE_CHALLENGE_HTML)
+
+
+def test_non_retryable_billing_failure_surfaces_classified_reason():
+    """CLI callers need the reason to map provider quota failures to exit 75."""
+    class BillingError(Exception):
+        status_code = 402
+
+    agent = _make_agent()
+    client = MagicMock()
+    agent.client = client
+    client.chat.completions.create.side_effect = BillingError("Insufficient credits")
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert client.chat.completions.create.called
+    assert result.get("failed") is True
+    assert result.get("failure_reason") == "billing"
