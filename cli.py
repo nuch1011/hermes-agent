@@ -15607,6 +15607,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     if not task_id:
         raise RuntimeError("goal_mode worker is missing HERMES_KANBAN_TASK")
 
+    raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        expected_run_id = int(raw_run_id)
+        if expected_run_id < 1:
+            raise ValueError
+    except ValueError:
+        raise RuntimeError(
+            "goal_mode worker requires a valid HERMES_KANBAN_RUN_ID"
+        ) from None
+
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
 
@@ -15622,6 +15632,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             pass
     if task is None:
         raise RuntimeError(f"goal_mode task {task_id} was not found")
+    if task.current_run_id != expected_run_id:
+        raise RuntimeError(
+            f"goal_mode task {task_id} run ownership changed "
+            f"(expected run {expected_run_id}, current run {task.current_run_id})"
+        )
 
     goal_parts = [task.title or ""]
     if task.body:
@@ -15657,6 +15672,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             t = _kb.get_task(c, task_id)
             if t is None:
                 raise RuntimeError(f"goal_mode task {task_id} disappeared")
+            if t.current_run_id != expected_run_id:
+                raise RuntimeError(
+                    f"goal_mode task {task_id} run ownership changed "
+                    f"(expected run {expected_run_id}, current run {t.current_run_id})"
+                )
             return t.status
         finally:
             try:
@@ -15667,8 +15687,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            if not _kb.block_task(c, task_id, reason=reason):
-                raise RuntimeError(f"could not block goal_mode task {task_id}")
+            if not _kb.block_task(
+                c,
+                task_id,
+                reason=reason,
+                expected_run_id=expected_run_id,
+            ):
+                raise RuntimeError(
+                    f"could not block goal_mode task {task_id}: "
+                    f"run ownership changed (expected run {expected_run_id})"
+                )
         finally:
             try:
                 c.close()
