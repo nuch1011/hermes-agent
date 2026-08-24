@@ -1480,6 +1480,45 @@ def test_scratch_workspace_created_under_hermes_home(kanban_home):
     assert "kanban" in str(ws)
 
 
+def test_shared_scratch_workspace_is_removed_after_last_active_child(
+    kanban_home, tmp_path
+):
+    shared = tmp_path / "shared-scratch"
+    shared.mkdir()
+    marker = shared / "worker-output.txt"
+    marker.write_text("keep until both children finish")
+
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn,
+            title="parent",
+            workspace_kind="dir",
+            workspace_path=str(shared),
+        )
+        first = kb.create_task(
+            conn,
+            title="first child",
+            parents=[parent],
+            workspace_path=str(shared),
+        )
+        second = kb.create_task(
+            conn,
+            title="second child",
+            parents=[parent],
+            workspace_path=str(shared),
+        )
+        kb.complete_task(conn, parent)
+        assert kb.claim_task(conn, first) is not None
+        assert kb.claim_task(conn, second) is not None
+
+        kb.complete_task(conn, first)
+        assert marker.exists()
+
+        kb.complete_task(conn, second)
+
+    assert not shared.exists()
+
+
 def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
     target = tmp_path / "my-vault"
     with kb.connect() as conn:
