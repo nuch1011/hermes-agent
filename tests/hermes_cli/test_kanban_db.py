@@ -1528,30 +1528,48 @@ def test_scratch_cleanup_preserves_persistently_owned_path(
     marker = shared / "owner-output.txt"
     marker.write_text("persistent")
 
-    with kb.connect() as conn:
+    kb.create_board("persistent-owner")
+    with kb.connect(board="persistent-owner") as conn:
         owner = kb.create_task(
             conn,
             title="persistent owner",
             workspace_kind=workspace_kind,
             workspace_path=str(shared),
         )
+        kb.complete_task(conn, owner)
+
+    with kb.connect(board="default") as conn:
         scratch = kb.create_task(
             conn,
             title="scratch alias",
             workspace_path=str(shared),
         )
-        kb.complete_task(conn, owner)
         kb.complete_task(conn, scratch)
 
     assert marker.read_text() == "persistent"
 
 
-def test_scratch_cleanup_serializes_concurrent_task_creation(
-    kanban_home, tmp_path, monkeypatch
+@pytest.mark.parametrize("concurrent_write", ["create", "reactivate"])
+def test_scratch_cleanup_serializes_concurrent_workspace_reference_write(
+    kanban_home, tmp_path, monkeypatch, concurrent_write
 ):
     shared = tmp_path / "scratch-race"
     shared.mkdir()
-    with kb.connect() as conn:
+    kb.create_board("other-board")
+    existing_task = None
+    if concurrent_write == "reactivate":
+        with kb.connect(board="other-board") as conn:
+            existing_task = kb.create_task(
+                conn,
+                title="terminal scratch task",
+                workspace_path=str(shared),
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'done' WHERE id = ?",
+                    (existing_task,),
+                )
+    with kb.connect(board="default") as conn:
         scratch = kb.create_task(
             conn,
             title="finishing scratch task",
@@ -1570,34 +1588,37 @@ def test_scratch_cleanup_serializes_concurrent_task_creation(
     monkeypatch.setattr(shutil, "rmtree", blocking_rmtree)
 
     def complete_scratch():
-        with kb.connect() as conn:
+        with kb.connect(board="default") as conn:
             assert kb.complete_task(conn, scratch)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    def write_on_other_board():
+        with kb.connect(board="other-board") as conn:
+            if existing_task is not None:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                        (existing_task,),
+                    )
+                return existing_task
+            return kb.create_task(
+                conn,
+                title="concurrent scratch task",
+                workspace_path=str(shared),
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         completion = executor.submit(complete_scratch)
         assert delete_started.wait(timeout=5)
-        second = sqlite3.connect(
-            str(kb.kanban_db_path()), isolation_level=None, timeout=0
-        )
-        second.row_factory = sqlite3.Row
+        creation = executor.submit(write_on_other_board)
         try:
-            with pytest.raises(sqlite3.OperationalError, match="locked"):
-                kb.create_task(
-                    second,
-                    title="concurrent scratch task",
-                    workspace_path=str(shared),
-                )
+            with pytest.raises(concurrent.futures.TimeoutError):
+                creation.result(timeout=0.2)
         finally:
             allow_delete.set()
-            second.close()
         completion.result(timeout=5)
+        new_task = creation.result(timeout=5)
 
-    with kb.connect() as conn:
-        new_task = kb.create_task(
-            conn,
-            title="task created after cleanup",
-            workspace_path=str(shared),
-        )
+    with kb.connect(board="other-board") as conn:
         task = kb.get_task(conn, new_task)
         assert task is not None
         workspace = kb.resolve_workspace(task)
