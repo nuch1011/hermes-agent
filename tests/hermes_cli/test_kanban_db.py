@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import shutil
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -1478,6 +1480,151 @@ def test_scratch_workspace_created_under_hermes_home(kanban_home):
     assert ws.exists()
     assert ws.is_dir()
     assert "kanban" in str(ws)
+
+
+def test_shared_scratch_workspace_is_removed_after_last_active_child(
+    kanban_home, tmp_path
+):
+    shared = tmp_path / "shared-scratch"
+    shared.mkdir()
+    marker = shared / "worker-output.txt"
+    marker.write_text("keep until both children finish")
+
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn,
+            title="parent",
+        )
+        first = kb.create_task(
+            conn,
+            title="first child",
+            parents=[parent],
+            workspace_path=str(shared),
+        )
+        second = kb.create_task(
+            conn,
+            title="second child",
+            parents=[parent],
+            workspace_path=str(shared),
+        )
+        kb.complete_task(conn, parent)
+        assert kb.claim_task(conn, first) is not None
+        assert kb.claim_task(conn, second) is not None
+
+        kb.complete_task(conn, first)
+        assert marker.exists()
+
+        kb.complete_task(conn, second)
+
+    assert not shared.exists()
+
+
+@pytest.mark.parametrize("workspace_kind", ["dir", "worktree"])
+def test_scratch_cleanup_preserves_persistently_owned_path(
+    kanban_home, tmp_path, workspace_kind
+):
+    shared = tmp_path / "persistent-workspace"
+    shared.mkdir()
+    marker = shared / "owner-output.txt"
+    marker.write_text("persistent")
+
+    kb.create_board("persistent-owner")
+    with kb.connect(board="persistent-owner") as conn:
+        owner = kb.create_task(
+            conn,
+            title="persistent owner",
+            workspace_kind=workspace_kind,
+            workspace_path=str(shared),
+        )
+        kb.complete_task(conn, owner)
+
+    with kb.connect(board="default") as conn:
+        scratch = kb.create_task(
+            conn,
+            title="scratch alias",
+            workspace_path=str(shared),
+        )
+        kb.complete_task(conn, scratch)
+
+    assert marker.read_text() == "persistent"
+
+
+@pytest.mark.parametrize("concurrent_write", ["create", "reactivate"])
+def test_scratch_cleanup_serializes_concurrent_workspace_reference_write(
+    kanban_home, tmp_path, monkeypatch, concurrent_write
+):
+    shared = tmp_path / "scratch-race"
+    shared.mkdir()
+    kb.create_board("other-board")
+    existing_task = None
+    if concurrent_write == "reactivate":
+        with kb.connect(board="other-board") as conn:
+            existing_task = kb.create_task(
+                conn,
+                title="terminal scratch task",
+                workspace_path=str(shared),
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'done' WHERE id = ?",
+                    (existing_task,),
+                )
+    with kb.connect(board="default") as conn:
+        scratch = kb.create_task(
+            conn,
+            title="finishing scratch task",
+            workspace_path=str(shared),
+        )
+
+    delete_started = threading.Event()
+    allow_delete = threading.Event()
+    real_rmtree = shutil.rmtree
+
+    def blocking_rmtree(path, *args, **kwargs):
+        delete_started.set()
+        assert allow_delete.wait(timeout=5)
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", blocking_rmtree)
+
+    def complete_scratch():
+        with kb.connect(board="default") as conn:
+            assert kb.complete_task(conn, scratch)
+
+    def write_on_other_board():
+        with kb.connect(board="other-board") as conn:
+            if existing_task is not None:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                        (existing_task,),
+                    )
+                return existing_task
+            return kb.create_task(
+                conn,
+                title="concurrent scratch task",
+                workspace_path=str(shared),
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        completion = executor.submit(complete_scratch)
+        assert delete_started.wait(timeout=5)
+        creation = executor.submit(write_on_other_board)
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                creation.result(timeout=0.2)
+        finally:
+            allow_delete.set()
+        completion.result(timeout=5)
+        new_task = creation.result(timeout=5)
+
+    with kb.connect(board="other-board") as conn:
+        task = kb.get_task(conn, new_task)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+    marker = workspace / "new-output.txt"
+    marker.write_text("safe")
+    assert marker.read_text() == "safe"
 
 
 def test_dir_workspace_honors_given_path(kanban_home, tmp_path):

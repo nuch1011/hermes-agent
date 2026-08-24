@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -79,7 +80,6 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1339,16 +1339,52 @@ def write_txn(conn: sqlite3.Connection):
 
     Use for any multi-statement write (creating a task + link, claiming a
     task + recording an event, etc.).  A claim CAS inside this context is
-    atomic -- at most one concurrent writer can succeed.
+    atomic -- at most one concurrent writer can succeed.  The shared file
+    lock extends that serialization across separate board databases so a
+    workspace reference cannot race cross-board scratch cleanup.
     """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
+    lock_path = kanban_home() / "kanban" / ".write.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as lock_file:
+        # ponytail: one lock serializes all boards; split by workspace path if
+        # cross-board write throughput ever matters.
+        if _IS_WINDOWS:
+            import msvcrt
+
+            lock_file.seek(0)
+            if not lock_file.read(1):
+                lock_file.seek(0)
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            getattr(msvcrt, "locking")(
+                lock_file.fileno(), getattr(msvcrt, "LK_LOCK"), 1
+            )
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            else:
+                conn.execute("COMMIT")
+        finally:
+            if _IS_WINDOWS:
+                import msvcrt
+
+                lock_file.seek(0)
+                getattr(msvcrt, "locking")(
+                    lock_file.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
+                )
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -2904,30 +2940,87 @@ def complete_task(
 # Workspace / tmux cleanup
 # ---------------------------------------------------------------------------
 
+def _workspace_is_referenced(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace_path: str,
+) -> bool:
+    """Return whether any board still owns or actively uses a workspace."""
+    try:
+        target = os.path.normcase(str(Path(workspace_path).expanduser().resolve()))
+        current_db = next(
+            Path(row[2]).resolve()
+            for row in conn.execute("PRAGMA database_list")
+            if row[1] == "main" and row[2]
+        )
+        db_paths = {current_db}
+        default_db = kanban_home() / "kanban.db"
+        if default_db.is_file():
+            db_paths.add(default_db.resolve())
+        root = boards_root()
+        if root.is_dir():
+            db_paths.update(path.resolve() for path in root.rglob("kanban.db"))
+
+        for db_path in db_paths:
+            other = conn if db_path == current_db else sqlite3.connect(
+                db_path.as_uri() + "?mode=ro",
+                uri=True,
+            )
+            try:
+                rows = other.execute(
+                    """
+                    SELECT id, workspace_path FROM tasks
+                     WHERE workspace_path IS NOT NULL
+                       AND (
+                           workspace_kind IN ('dir', 'worktree')
+                           OR status NOT IN ('done', 'archived')
+                       )
+                    """
+                )
+                for row in rows:
+                    if db_path == current_db and row[0] == task_id:
+                        continue
+                    candidate = os.path.normcase(
+                        str(Path(row[1]).expanduser().resolve())
+                    )
+                    if candidate == target:
+                        return True
+            finally:
+                if other is not conn:
+                    other.close()
+    except Exception:
+        return True
+    return False
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
     Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    are intentionally preserved.  Ownership checks and removal share an
+    IMMEDIATE write transaction so task references cannot change between them.
     """
     try:
-        row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row:
-            return
-        kind: Optional[str] = row["workspace_kind"]
-        path: Optional[str] = row["workspace_path"]
-        if kind != "scratch" or not path:
-            return
         import shutil
-        wp = Path(path)
-        if wp.is_dir():
-            shutil.rmtree(wp, ignore_errors=True)
-            _log.debug("Removed scratch workspace: %s", wp)
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                return
+            kind: Optional[str] = row["workspace_kind"]
+            path: Optional[str] = row["workspace_path"]
+            if kind != "scratch" or not path:
+                return
+            wp = Path(path)
+            if _workspace_is_referenced(conn, task_id, path):
+                _log.debug("Preserved shared or persistent workspace: %s", wp)
+            elif wp.is_dir():
+                shutil.rmtree(wp, ignore_errors=True)
+                _log.debug("Removed scratch workspace: %s", wp)
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
