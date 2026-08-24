@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import shutil
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -1492,8 +1494,6 @@ def test_shared_scratch_workspace_is_removed_after_last_active_child(
         parent = kb.create_task(
             conn,
             title="parent",
-            workspace_kind="dir",
-            workspace_path=str(shared),
         )
         first = kb.create_task(
             conn,
@@ -1517,6 +1517,93 @@ def test_shared_scratch_workspace_is_removed_after_last_active_child(
         kb.complete_task(conn, second)
 
     assert not shared.exists()
+
+
+@pytest.mark.parametrize("workspace_kind", ["dir", "worktree"])
+def test_scratch_cleanup_preserves_persistently_owned_path(
+    kanban_home, tmp_path, workspace_kind
+):
+    shared = tmp_path / "persistent-workspace"
+    shared.mkdir()
+    marker = shared / "owner-output.txt"
+    marker.write_text("persistent")
+
+    with kb.connect() as conn:
+        owner = kb.create_task(
+            conn,
+            title="persistent owner",
+            workspace_kind=workspace_kind,
+            workspace_path=str(shared),
+        )
+        scratch = kb.create_task(
+            conn,
+            title="scratch alias",
+            workspace_path=str(shared),
+        )
+        kb.complete_task(conn, owner)
+        kb.complete_task(conn, scratch)
+
+    assert marker.read_text() == "persistent"
+
+
+def test_scratch_cleanup_serializes_concurrent_task_creation(
+    kanban_home, tmp_path, monkeypatch
+):
+    shared = tmp_path / "scratch-race"
+    shared.mkdir()
+    with kb.connect() as conn:
+        scratch = kb.create_task(
+            conn,
+            title="finishing scratch task",
+            workspace_path=str(shared),
+        )
+
+    delete_started = threading.Event()
+    allow_delete = threading.Event()
+    real_rmtree = shutil.rmtree
+
+    def blocking_rmtree(path, *args, **kwargs):
+        delete_started.set()
+        assert allow_delete.wait(timeout=5)
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", blocking_rmtree)
+
+    def complete_scratch():
+        with kb.connect() as conn:
+            assert kb.complete_task(conn, scratch)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        completion = executor.submit(complete_scratch)
+        assert delete_started.wait(timeout=5)
+        second = sqlite3.connect(
+            str(kb.kanban_db_path()), isolation_level=None, timeout=0
+        )
+        second.row_factory = sqlite3.Row
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                kb.create_task(
+                    second,
+                    title="concurrent scratch task",
+                    workspace_path=str(shared),
+                )
+        finally:
+            allow_delete.set()
+            second.close()
+        completion.result(timeout=5)
+
+    with kb.connect() as conn:
+        new_task = kb.create_task(
+            conn,
+            title="task created after cleanup",
+            workspace_path=str(shared),
+        )
+        task = kb.get_task(conn, new_task)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+    marker = workspace / "new-output.txt"
+    marker.write_text("safe")
+    assert marker.read_text() == "safe"
 
 
 def test_dir_workspace_honors_given_path(kanban_home, tmp_path):

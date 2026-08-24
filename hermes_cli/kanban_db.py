@@ -2910,36 +2910,41 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
     Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    are intentionally preserved.  Ownership checks and removal share an
+    IMMEDIATE write transaction so task references cannot change between them.
     """
     try:
-        row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row:
-            return
-        kind: Optional[str] = row["workspace_kind"]
-        path: Optional[str] = row["workspace_path"]
-        if kind != "scratch" or not path:
-            return
         import shutil
-        wp = Path(path)
-        active_user = conn.execute(
-            """
-            SELECT 1 FROM tasks
-             WHERE id != ?
-               AND workspace_path = ?
-               AND status NOT IN ('done', 'archived')
-             LIMIT 1
-            """,
-            (task_id, path),
-        ).fetchone()
-        if active_user:
-            _log.debug("Preserved shared scratch workspace still in use: %s", wp)
-        elif wp.is_dir():
-            shutil.rmtree(wp, ignore_errors=True)
-            _log.debug("Removed scratch workspace: %s", wp)
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                return
+            kind: Optional[str] = row["workspace_kind"]
+            path: Optional[str] = row["workspace_path"]
+            if kind != "scratch" or not path:
+                return
+            wp = Path(path)
+            protected_user = conn.execute(
+                """
+                SELECT 1 FROM tasks
+                 WHERE id != ?
+                   AND workspace_path = ?
+                   AND (
+                       workspace_kind IN ('dir', 'worktree')
+                       OR status NOT IN ('done', 'archived')
+                   )
+                 LIMIT 1
+                """,
+                (task_id, path),
+            ).fetchone()
+            if protected_user:
+                _log.debug("Preserved shared or persistent workspace: %s", wp)
+            elif wp.is_dir():
+                shutil.rmtree(wp, ignore_errors=True)
+                _log.debug("Removed scratch workspace: %s", wp)
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
