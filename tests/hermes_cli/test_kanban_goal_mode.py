@@ -360,7 +360,7 @@ def test_goal_loop_stale_run_cannot_block_reclaimed_task(kanban_home, monkeypatc
         conversation_history = []
         session_id = "session"
 
-    with pytest.raises(RuntimeError, match="could not block"):
+    with pytest.raises(RuntimeError, match="no longer current"):
         cli_module._run_kanban_goal_loop_q(
             _CLI(), "first response"  # type: ignore[arg-type]
         )
