@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 from gateway.config import Platform
+from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -13,6 +14,7 @@ class RecordingAdapter:
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(success=True)
 
 
 class DisconnectedAdapters(dict):

@@ -59,6 +59,7 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
+        "requires_interactive_approval": t.requires_interactive_approval,
         "id": t.id,
         "title": t.title,
         "body": t.body,
@@ -347,6 +348,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "two retries. Omit to use the dispatcher's "
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
+    p_create.add_argument("--requires-interactive-approval", action="store_true",
+                          help="Known interactive approval requirement; default headless dispatch blocks before spawn.")
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -1345,6 +1348,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
+            requires_interactive_approval=getattr(args, "requires_interactive_approval", False),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )

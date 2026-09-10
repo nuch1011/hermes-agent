@@ -352,6 +352,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
+        "requires_interactive_approval": task.requires_interactive_approval,
         "model_override": task.model_override,
         "parents": parents,
         "children": children,
@@ -397,6 +398,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "completed_at": t.completed_at,
                     "result": t.result,
                     "current_run_id": t.current_run_id,
+                    "requires_interactive_approval": t.requires_interactive_approval,
                     "model_override": t.model_override,
                 }
 
@@ -881,6 +883,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
+    requires_interactive_approval = args.get("requires_interactive_approval", False)
+    if type(requires_interactive_approval) is not bool:
+        return tool_error("requires_interactive_approval must be a boolean")
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
@@ -927,6 +932,7 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 skills=skills,
                 goal_mode=goal_mode,
+                requires_interactive_approval=requires_interactive_approval,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
@@ -1517,6 +1523,11 @@ KANBAN_CREATE_SCHEMA = {
                     "The names must match skills installed on the "
                     "assignee's profile."
                 ),
+            },
+            "requires_interactive_approval": {
+                "type": "boolean",
+                "default": False,
+                "description": "Known interactive approval requirement. Default headless dispatch blocks before spawn; a notification subscription is not an approval channel.",
             },
             "goal_mode": {
                 "type": "boolean",

@@ -2534,6 +2534,57 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _kanban_approval_unavailable() -> dict:
+    """Deny without queuing; only the pinned, still-owned run may be blocked."""
+    result = {
+        "approved": False,
+        "approval_pending": False,
+        "status": "approval_unavailable",
+        "user_consent": False,
+        "board_updated": False,
+        "notification_status": "unverified",
+        "message": (
+            "BLOCKED: Approval is required but this Kanban worker has no "
+            "interactive approval channel. No approval request was queued. "
+            "Stop and have the operator coordinate an interactive run of this "
+            "work, reviewing the specific action there. Do NOT blindly retry, "
+            "rephrase the action, use another tool, or weaken approval policy."
+        ),
+    }
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    db_pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    board_pin = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if not task_id or not (db_pin or board_pin):
+        result["board_error"] = "missing_worker_scope"
+    elif not re.fullmatch(r"[1-9][0-9]*", run_id):
+        result["board_error"] = "invalid_run_id"
+    else:
+        try:
+            from hermes_cli import kanban_db as kb
+
+            # Pass the board explicitly: never follow `current` or fall back to
+            # the default board if the worker's pin is absent or malformed.
+            path = kb.kanban_db_path(board=board_pin or None)
+            if not path.is_absolute() or not path.is_file():
+                raise ValueError("Pinned board database unavailable")
+            with kb.connect_closing(db_path=path) as conn:
+                blocked = kb.block_approval_unavailable(
+                    conn, task_id, expected_run_id=int(run_id),
+                )
+            result["board_updated"] = blocked["board_updated"]
+            result["notification_status"] = blocked["notification_status"]
+            if not result["board_updated"]:
+                result["board_error"] = "stale_or_missing_claim"
+        except Exception:
+            # Never leak command text, filesystem paths, or raw DB errors into
+            # tool results or durable board events. Execution remains denied.
+            result["board_error"] = "board_update_failed"
+    if not result["board_updated"]:
+        result["message"] += " The board was not updated; the operator must inspect it manually."
+    return result
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -2868,6 +2919,9 @@ def check_all_command_guards(command: str, env_type: str,
             return {"approved": True, "message": None,
                     "user_approved": True, "description": combined_desc}
 
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return _kanban_approval_unavailable()
+
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Return approval_required for backward compat. Redact secrets in the
         # user-facing copy — the raw `command` is preserved for execution and
@@ -3072,6 +3126,9 @@ def check_execute_code_guard(code: str, env_type: str,
         notify_cb = _gateway_notify_cbs.get(session_key)
 
     if notify_cb is None:
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return _kanban_approval_unavailable()
+
         # No gateway callback registered (e.g. ask-mode without a notifier):
         # surface a pending approval for backward compatibility.
         submit_pending(session_key, {

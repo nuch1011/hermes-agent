@@ -1161,6 +1161,7 @@ def execute_code(
     if not _guard.get("approved", False):
         return json.dumps({
             "status": "error",
+            **(_guard if _guard.get("status") == "approval_unavailable" else {}),
             "error": _guard.get("message") or "execute_code blocked by approval guard.",
             "tool_calls_made": 0,
             "duration_seconds": 0,

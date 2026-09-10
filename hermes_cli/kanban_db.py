@@ -914,6 +914,8 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Explicit known approval requirement, not a prediction of future tool calls.
+    requires_interactive_approval: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -977,6 +979,10 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
+            requires_interactive_approval=(
+                bool(row["requires_interactive_approval"])
+                if "requires_interactive_approval" in keys else False
+            ),
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
@@ -1154,6 +1160,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- or ``goal_max_turns`` is exhausted. NULL/0 = classic single-shot
     -- worker (the default).
     goal_mode            INTEGER NOT NULL DEFAULT 0,
+    requires_interactive_approval INTEGER NOT NULL DEFAULT 0 CHECK (requires_interactive_approval IN (0, 1)),
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
@@ -1955,6 +1962,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"
         )
 
+    if "requires_interactive_approval" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "requires_interactive_approval",
+            "requires_interactive_approval INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (requires_interactive_approval IN (0, 1))",
+        )
+
     if "goal_max_turns" not in cols:
         # Per-task goal-loop turn budget. NULL = goals-engine default.
         _add_column_if_missing(
@@ -2403,6 +2417,7 @@ def create_task(
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    requires_interactive_approval: bool = False,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -2431,6 +2446,8 @@ def create_task(
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
     """
+    if type(requires_interactive_approval) is not bool:
+        raise ValueError("requires_interactive_approval must be a boolean")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -2635,8 +2652,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        requires_interactive_approval
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2659,6 +2677,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        int(requires_interactive_approval),
                     ),
                 )
                 for pid in parents:
@@ -4538,6 +4557,36 @@ def edit_completed_task_result(
     return True
 
 
+def block_approval_unavailable(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: int,
+) -> dict:
+    """Deny headless approval and block only the current live worker claim.
+
+    A subscription is a delivery address, not a live approval channel. No
+    message is sent here; the existing blocked-event watcher handles delivery.
+    Claim validation and blocking share block_task's IMMEDIATE transaction.
+    """
+    subscribed = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? LIMIT 1", (task_id,),
+    ).fetchone()
+    notification_status = (
+        "subscription_present_delivery_unverified" if subscribed else "no_subscription"
+    )
+    reason = (
+        "approval_unavailable: no interactive approval channel. Coordinate an "
+        "interactive run with a human, then reassess this task; do not blindly "
+        "retry or weaken approval policy. Notification: " + notification_status + "."
+    )
+    updated = block_task(
+        conn, task_id, reason=reason, kind="capability",
+        expected_run_id=expected_run_id, require_active_claim=True,
+    )
+    result = {"board_updated": updated, "notification_status": notification_status}
+    if not updated:
+        result["error"] = "stale_or_missing_claim"
+    return result
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4545,6 +4594,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    require_active_claim: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -4580,6 +4630,21 @@ def block_task(
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
+        if require_active_claim:
+            if type(expected_run_id) is not int or expected_run_id <= 0:
+                return False
+            now = int(time.time())
+            owned = conn.execute(
+                "SELECT 1 FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+                "AND r.task_id = t.id WHERE t.id = ? AND t.current_run_id = ? "
+                "AND t.status = 'running' AND t.claim_lock IS NOT NULL "
+                "AND t.claim_lock != '' AND t.claim_expires > ? "
+                "AND r.status = 'running' AND r.ended_at IS NULL "
+                "AND r.claim_lock = t.claim_lock AND r.claim_expires > ?",
+                (task_id, expected_run_id, now, now),
+            ).fetchone()
+            if owned is None:
+                return False
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -7255,6 +7320,11 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        if spawn_fn is None and claimed.requires_interactive_approval:
+            blocked = block_approval_unavailable(conn, claimed.id, claimed.current_run_id)
+            if blocked["board_updated"]:
+                result.auto_blocked.append(claimed.id)
+            continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -7346,6 +7416,11 @@ def _dispatch_once_locked(
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        if spawn_fn is None and claimed.requires_interactive_approval:
+            blocked = block_approval_unavailable(conn, claimed.id, claimed.current_run_id)
+            if blocked["board_updated"]:
+                result.auto_blocked.append(claimed.id)
             continue
         try:
             resolved_branch_name = None
