@@ -413,6 +413,35 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+### Tasks known to require interactive approval
+
+Set `requires_interactive_approval: true` when creating a task through the
+`kanban_create` tool or a task-create API, or pass
+`--requires-interactive-approval` to `hermes kanban create`. This is a strict
+boolean, defaults to `false` (including migrated tasks), and records a **known
+requirement**, not consent or a prediction of future tool calls.
+
+The default dispatcher has no interactive approval channel. It therefore claims
+an opted-in task and blocks it with `kind=capability` and `approval_unavailable`
+**before workspace creation or worker spawn**, including dispatchable review
+tasks. Supplying a custom `spawn_fn` is outside this default-spawner preflight;
+its caller owns that channel contract. The flag does not alter approval policy.
+
+For an already-running Kanban worker, if `terminal` or `execute_code` needs
+approval but has no notifier callback, it denies execution without queuing a
+process-local pending request. Only the still-current live claim on the worker's
+pinned board may be blocked; a stale run or database failure cannot authorize
+execution. Arrange an interactive run and review the specific action there;
+do not blindly retry, rephrase it, switch tools, or weaken policy.
+
+A notification subscription is **not an approval channel**. `no_subscription`
+means there is no registered destination; `subscription_present_delivery_unverified`
+is only a routing observation. The watcher accepts only a typed
+`SendResult(success=True)` as transport success. Failed sends rewind the claim;
+after three consecutive failed delivery batches the watcher removes the subscription.
+Neither a subscription, a cursor, nor transport success proves human consent
+or that a person read the message.
+
 ### Goal-mode cards (`--goal`)
 
 By default each worker gets **one shot** at its card — do the work, call `kanban_complete`/`kanban_block`, exit. Pass `--goal` (CLI) or `goal_mode=True` (the `kanban_create` tool / dashboard) to instead run that worker in a **goal loop**, the same Ralph-style engine behind the `/goal` slash command: after every turn an auxiliary judge checks the worker's output against the card's title + body (treated as the acceptance criteria), and if the work isn't done — and the turn budget remains — the worker keeps going **in the same session** until the judge agrees, the worker terminates the task itself, or the budget runs out (which **blocks** the card for human review rather than exiting silently).

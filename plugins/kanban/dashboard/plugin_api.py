@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -591,6 +591,7 @@ class CreateTaskBody(BaseModel):
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
     goal_mode: bool = False
+    requires_interactive_approval: StrictBool = False
     goal_max_turns: Optional[int] = None
 
 
@@ -615,6 +616,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
             goal_mode=payload.goal_mode,
+            requires_interactive_approval=payload.requires_interactive_approval,
             goal_max_turns=payload.goal_max_turns,
         )
         task = kanban_db.get_task(conn, task_id)

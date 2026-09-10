@@ -2284,6 +2284,13 @@ def terminal_tool(
                 has_host_access=_docker_has_host_access(config),
             )
             if not approval["approved"]:
+                if approval.get("status") == "approval_unavailable":
+                    return json.dumps({
+                        **approval,
+                        "output": "",
+                        "exit_code": -1,
+                        "error": approval["message"],
+                    }, ensure_ascii=False)
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
                     return json.dumps({
