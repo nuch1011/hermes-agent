@@ -15592,7 +15592,7 @@ def _single_query_exit_code(result: Any) -> int:
     return 1
 
 
-def _require_kanban_goal_run_q() -> tuple[Any, int]:
+def _require_kanban_goal_run_q(*, allow_finished: bool = False) -> tuple[Any, int]:
     """Return the task and positive run id for the current quiet goal run."""
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
@@ -15608,17 +15608,38 @@ def _require_kanban_goal_run_q() -> tuple[Any, int]:
         raise RuntimeError(
             "goal_mode worker requires a positive HERMES_KANBAN_RUN_ID"
         )
+    return _kanban_goal_task_q(task_id, run_id, allow_finished=allow_finished), run_id
+
+
+def _kanban_goal_task_q(task_id: str, run_id: int, *, allow_finished: bool = False):
+    """Read ownership and terminal-run evidence from one SQLite snapshot."""
     from hermes_cli import kanban_db as _kb
 
-    with _kb.connect() as conn:
+    with _kb.connect_closing() as conn:
+        conn.execute("BEGIN")
         task = _kb.get_task(conn, task_id)
+        latest = _kb.latest_run(conn, task_id)
     if task is None:
-        raise RuntimeError(f"goal_mode task {task_id} was not found")
-    if task.current_run_id != run_id or task.status not in ("running", "ready"):
-        raise RuntimeError(
-            f"goal_mode run {run_id} is no longer current for task {task_id}"
+        raise RuntimeError(f"goal_mode task {task_id} was not found or disappeared")
+    if task.current_run_id == run_id and task.status in ("running", "ready"):
+        return task
+    # _end_run clears current_run_id. Only our own latest completed/blocked
+    # run proves a successful lifecycle action, never a reclaimed/replaced run.
+    if (
+        allow_finished
+        and task.current_run_id is None
+        and latest is not None
+        and latest.id == run_id
+        and latest.ended_at is not None
+        and (
+            (latest.outcome == "completed" and task.status == "done")
+            or (latest.outcome == "blocked" and task.status in ("blocked", "todo", "triage"))
         )
-    return task, run_id
+    ):
+        return task
+    raise RuntimeError(
+        f"goal_mode run {run_id} is no longer current for task {task_id}"
+    )
 
 
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
@@ -15633,7 +15654,9 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
 
-    task, run_id = _require_kanban_goal_run_q()
+    task, run_id = _require_kanban_goal_run_q(allow_finished=True)
+    if task.current_run_id is None:
+        return
     task_id = task.id
 
     # Resolve goal text from the card (title + body = the acceptance
@@ -15646,6 +15669,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     def _run_turn(prompt: str) -> str:
+        _kanban_goal_task_q(task_id, run_id)
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
@@ -15667,17 +15691,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return resp or ""
 
     def _task_status() -> str:
-        c = _kb.connect()
-        try:
-            t = _kb.get_task(c, task_id)
-            if t is None:
-                raise RuntimeError(f"goal_mode task {task_id} disappeared")
-            return t.status
-        finally:
-            try:
-                c.close()
-            except Exception:
-                pass
+        return _kanban_goal_task_q(task_id, run_id, allow_finished=True).status
 
     def _block(reason: str) -> None:
         c = _kb.connect()
