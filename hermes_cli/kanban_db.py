@@ -954,6 +954,49 @@ _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 
 
+def deleted_wal_sidecar_fds(path: Path) -> list[dict[str, Any]]:
+    """Return current-process FDs to deleted WAL/SHM sidecars for ``path``.
+
+    SQLite keeps WAL/SHM sidecar file descriptors open for the lifetime of a
+    connection. If those sidecars are unlinked while a gateway dispatcher or
+    notifier connection is still alive, subsequent writes can surface as
+    ``sqlite3.OperationalError: disk I/O error`` even though the main DB passes
+    integrity checks. On Linux, ``/proc/self/fd`` exposes those stale handles as
+    ``...-wal (deleted)`` / ``...-shm (deleted)``; on platforms without procfs we
+    return an empty list and let normal SQLite errors drive recovery.
+    """
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.exists():
+        return []
+    try:
+        resolved = str(path.expanduser().resolve())
+    except OSError:
+        resolved = str(path.expanduser())
+    sidecars = {f"{resolved}-wal": "-wal", f"{resolved}-shm": "-shm"}
+    stale: list[dict[str, Any]] = []
+    try:
+        entries = list(fd_dir.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        try:
+            target = os.readlink(entry)
+        except OSError:
+            continue
+        if " (deleted)" not in target:
+            continue
+        live_target = target.removesuffix(" (deleted)")
+        suffix = sidecars.get(live_target)
+        if suffix is None:
+            continue
+        try:
+            fd = int(entry.name)
+        except ValueError:
+            fd = -1
+        stale.append({"fd": fd, "suffix": suffix, "target": target})
+    return stale
+
+
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
     """Return True for a TLS record header at ``data[offset:]``."""
     if len(data) < offset + 5:
@@ -1035,6 +1078,18 @@ def connect(
     path.parent.mkdir(parents=True, exist_ok=True)
     _validate_sqlite_header(path)
     resolved = str(path.resolve())
+    stale_sidecars = deleted_wal_sidecar_fds(path)
+    if stale_sidecars:
+        stale_summary = ", ".join(
+            f"fd={entry['fd']}:{entry['suffix']}" for entry in stale_sidecars
+        )
+        _log.warning(
+            "kanban.db (%s) has deleted WAL/SHM sidecar file descriptors "
+            "still open in this process before connect: %s; opening a fresh "
+            "connection and relying on caller retry/close to release stale handles",
+            path.name,
+            stale_summary,
+        )
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
     try:
         conn.row_factory = sqlite3.Row
