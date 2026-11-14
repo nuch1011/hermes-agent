@@ -1045,7 +1045,7 @@ def _file_lock(
 
 
 @contextmanager
-def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS, *, auth_file: Optional[Path] = None):
     """Cross-process advisory lock for auth.json reads+writes.  Reentrant.
 
     Lock ordering invariant: when this lock is held together with
@@ -1054,9 +1054,16 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
     refresh paths follow this order; violating it risks deadlock
     against a concurrent import on the shared store.
     """
+    # Reentrancy belongs to a canonical path, NOT merely to this thread. A
+    # profile lock must never make acquiring the root lock a no-op.
+    lock_path = (auth_file.with_suffix(".lock") if auth_file is not None else _auth_lock_path()).resolve()
+    holders = getattr(_auth_lock_holder, "paths", None)
+    if holders is None:
+        holders = _auth_lock_holder.paths = {}
+    holder = holders.setdefault(str(lock_path), threading.local())
     with _file_lock(
-        _auth_lock_path(),
-        _auth_lock_holder,
+        lock_path,
+        holder,
         timeout_seconds,
         "Timed out waiting for auth store lock",
     ):
@@ -1283,7 +1290,7 @@ def get_auth_provider_display_name(provider_id: str) -> str:
     return SERVICE_PROVIDER_NAMES.get(normalized, provider_id)
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any] | List[Dict[str, Any]]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1299,6 +1306,11 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     Writes always go to the profile (``write_credential_pool`` is unchanged).
     See issue #18594 follow-up.
     """
+    if provider_id == "openai-codex":
+        with _codex_store_lock():
+            store = _codex_source_store()
+            entries = store.get("credential_pool", {}).get(provider_id, [])
+            return list(entries) if isinstance(entries, list) else []
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
@@ -1314,6 +1326,9 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         merged = dict(pool)
         for gp_key, gp_entries in global_pool.items():
             if not isinstance(gp_entries, list) or not gp_entries:
+                continue
+            # Codex ownership covers BOTH singleton and pool-only logins.
+            if gp_key == "openai-codex" and _codex_has_local_state(auth_store):
                 continue
             # Per-provider shadowing: profile wins whenever it has ANY entries.
             existing = merged.get(gp_key)
@@ -1335,6 +1350,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    target_path: Optional[Path] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1351,8 +1367,8 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with _auth_store_lock(auth_file=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1378,7 +1394,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
@@ -3193,6 +3209,46 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _codex_has_local_state(store: Dict[str, Any]) -> bool:
+    # A deliberate local login (including pool-only auth add) shadows root as
+    # a whole. Never mix a local account with a root singleton or pool.
+    providers = store.get("providers", {})
+    pool = store.get("credential_pool", {})
+    return (isinstance(providers, dict) and "openai-codex" in providers) or (
+        isinstance(pool, dict) and bool(pool.get("openai-codex"))
+    )
+
+
+def _codex_source_path() -> Path:
+    local = _auth_file_path()
+    if _codex_has_local_state(_load_auth_store()):
+        return local
+    root = _global_auth_file_path()
+    if root is not None and _codex_has_local_state(_load_global_auth_store()):
+        return root
+    return local
+
+
+@contextmanager
+def _codex_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    """Lock profile then owner; re-read only AFTER the owner's canonical flock.
+
+    Root users of the old implementation use exactly the same auth.lock.
+    No process ever takes a profile lock while holding only the root lock.
+    """
+    with _auth_store_lock(timeout_seconds=timeout_seconds):
+        source = _codex_source_path()
+        with _auth_store_lock(timeout_seconds=timeout_seconds, auth_file=source):
+            yield source
+
+
+def _codex_source_store() -> Dict[str, Any]:
+    source = _codex_source_path()
+    if source == _auth_file_path():
+        return _load_auth_store()
+    return _load_global_auth_store()
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
@@ -3200,11 +3256,11 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     Raises AuthError if no Codex tokens are stored.
     """
     if _lock:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _codex_store_lock():
+            auth_store = _codex_source_store()
     else:
-        auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+        auth_store = _codex_source_store()
+    state = auth_store.get("providers", {}).get("openai-codex")
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
@@ -3343,13 +3399,15 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
+def _save_codex_tokens(tokens: Dict[str, str], last_refresh: Optional[str] = None, label: Optional[str] = None, *, source_path: Optional[Path] = None) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state = _load_provider_state(auth_store, "openai-codex") or {}
+    # Explicit login saves default to LOCAL, even when a root login exists.
+    target = source_path if source_path is not None else _auth_file_path()
+    with _auth_store_lock(auth_file=target):
+        auth_store = _load_auth_store(target)
+        state = dict(auth_store.get("providers", {}).get("openai-codex") or {})
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
         # (which should be refreshed) from independent accounts that
@@ -3368,11 +3426,16 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=target)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
     """Adopt a valid Codex CLI token pair into Hermes auth, if available."""
+    # Never repair a borrowed login by importing a different application's
+    # grant. Shared refresh failures are fail-closed; re-login at the owner.
+    source = _codex_source_path()
+    if source != _auth_file_path():
+        return None
     imported = _import_codex_cli_tokens()
     # Require BOTH tokens before adopting: persisting a payload without a
     # usable refresh_token would only break the next refresh cycle.
@@ -3561,7 +3624,7 @@ def _refresh_codex_auth_tokens(
     updated_tokens["access_token"] = refreshed["access_token"]
     updated_tokens["refresh_token"] = refreshed["refresh_token"]
 
-    _save_codex_tokens(updated_tokens)
+    _save_codex_tokens(updated_tokens, source_path=_codex_source_path())
     return updated_tokens
 
 
@@ -3617,7 +3680,12 @@ def resolve_codex_runtime_credentials(
     credential. See issue #32992.
     """
     read_error: Optional[AuthError] = None
+    with _codex_store_lock():
+        pool_rows = _codex_source_store().get("credential_pool", {}).get("openai-codex", [])
+    manual_oauth = any(isinstance(e, dict) and e.get("source") == "manual:device_code" and e.get("access_token") for e in pool_rows)
     try:
+        if manual_oauth:
+            raise AuthError("Codex login is selected from the credential pool", provider="openai-codex", code="codex_auth_missing")
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
@@ -3635,7 +3703,7 @@ def resolve_codex_runtime_credentials(
             data = None
 
     if data is None:
-        pool_token = _pool_codex_access_token()
+        pool_token = _pool_codex_access_token(force_refresh=force_refresh)
         if pool_token:
             base_url = (
                 os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
@@ -3687,12 +3755,13 @@ def resolve_codex_runtime_credentials(
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        observed_tokens = dict(tokens)
+        with _codex_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
 
-            should_refresh = bool(force_refresh)
+            should_refresh = bool(force_refresh) and tokens == observed_tokens
             if (not should_refresh) and refresh_if_expiring:
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
@@ -3742,8 +3811,8 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _codex_store_lock():
+            auth_store = _codex_source_store()
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             return None
@@ -3788,7 +3857,7 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     return None
 
 
-def _pool_codex_access_token() -> str:
+def _pool_codex_access_token(*, force_refresh: bool = False) -> str:
     """Return the most-recent usable access_token from the openai-codex pool.
 
     Used as a fallback by ``resolve_codex_runtime_credentials`` when the
@@ -3799,8 +3868,8 @@ def _pool_codex_access_token() -> str:
     the original AuthError).
     """
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _codex_store_lock():
+            auth_store = _codex_source_store()
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             return ""
@@ -3820,6 +3889,13 @@ def _pool_codex_access_token() -> str:
                 return False
             return True
 
+        if any(isinstance(e, dict) and e.get("auth_type") == "oauth" for e in entries):
+            from agent.credential_pool import load_pool
+            pool = load_pool("openai-codex")
+            selected = pool.select()
+            if selected is not None and force_refresh:
+                selected = pool.try_refresh_current()
+            return str(selected.access_token).strip() if selected else ""
         for entry in entries:
             if _entry_usable(entry):
                 return str(entry.get("access_token", "")).strip()

@@ -100,11 +100,12 @@ def test_pool_refresh_writes_through_to_root_when_profile_reads_root(
         _entry(provider, id="e1", access_token="new-access", refresh_token="new-refresh")
     )
 
-    # Profile got the rotated chain (existing behavior).
     profile = _read_store(profile_path)
-    assert (
-        profile["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
-    )
+    if provider == "openai-codex":
+        # Borrowed Codex grants remain root-owned; no local token fork.
+        assert provider not in profile["providers"]
+    else:
+        assert profile["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
 
     # AND the global root no longer holds the revoked refresh token (#48415).
     root = _read_store(root_path)
