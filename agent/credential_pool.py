@@ -1435,9 +1435,9 @@ class CredentialPool:
             return False
         return False
 
-    def select(self) -> Optional[PooledCredential]:
+    def select(self, *, refresh: bool = True) -> Optional[PooledCredential]:
         with self._lock:
-            return self._select_unlocked()
+            return self._select_unlocked(refresh=refresh)
 
     def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
         """Return entries not currently in exhaustion cooldown.
@@ -1561,8 +1561,8 @@ class CredentialPool:
             self._persist(removed_ids=entries_to_prune)
         return available
 
-    def _select_unlocked(self) -> Optional[PooledCredential]:
-        available = self._available_entries(clear_expired=True, refresh=True)
+    def _select_unlocked(self, *, refresh: bool = True) -> Optional[PooledCredential]:
+        available = self._available_entries(clear_expired=True, refresh=refresh)
         if not available:
             self._current_id = None
             logger.info("credential pool: no available entries (all exhausted or empty)")

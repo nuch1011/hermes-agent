@@ -23,6 +23,9 @@ or deploy/restart any runtime.
   login does not copy borrowed root accounts into the profile.
 - Shared refresh errors do not recover by importing another application's
   credentials. They fail closed at the owner.
+- Pool-only status resolution honors `refresh_if_expiring=False` without network
+  calls. A forced retry refreshes once, not both proactively and again by force.
+  A durable-write failure does not expose the unpersisted grant via a cached pool.
 
 Minimal runtime file set: `hermes_cli/auth.py`, `agent/credential_pool.py`.
 The auxiliary client uses the existing pool selection path and needs no change.

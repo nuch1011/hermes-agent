@@ -287,3 +287,34 @@ def test_removed_cached_manual_login_does_not_refresh_or_reappear(stores, monkey
     pool.select()
     pool._persist()
     assert all(r["id"] != "removed" for r in json.loads(root.read_text())["credential_pool"]["openai-codex"])
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_pool_only_respects_no_network_flag_and_forces_exactly_once(stores, monkeypatch, force):
+    root, profile = stores
+    expired = jwt(1)
+    store(root, rows=[row(token=expired)])
+    calls = []
+    fresh = jwt(int(time.time()) + 7200)
+    def refresh(at, rt, **kwargs):
+        calls.append(rt)
+        return {"access_token": fresh, "refresh_token": "synthetic-next"}
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", refresh)
+    resolved = A.resolve_codex_runtime_credentials(force_refresh=force, refresh_if_expiring=False)
+    assert resolved["api_key"] == (fresh if force else expired)
+    assert calls == (["synthetic-old"] if force else [])
+
+
+def test_failed_durable_write_does_not_expose_rotated_cached_grant(stores, monkeypatch):
+    root, profile = stores
+    store(root, rows=[row()])
+    pool = load_pool("openai-codex")
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", lambda *a, **kw: {"access_token": jwt(int(time.time()) + 7200), "refresh_token": "synthetic-next"})
+    def fail(*a, **kw):
+        raise OSError("synthetic disk failure")
+    monkeypatch.setattr(A, "_save_auth_store", fail)
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        pool.select()
+    assert not pool.entries()
+    assert pool.select() is None
+    assert b"synthetic-next" not in root.read_bytes()

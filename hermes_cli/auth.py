@@ -3703,7 +3703,7 @@ def resolve_codex_runtime_credentials(
             data = None
 
     if data is None:
-        pool_token = _pool_codex_access_token(force_refresh=force_refresh)
+        pool_token = _pool_codex_access_token(force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring)
         if pool_token:
             base_url = (
                 os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
@@ -3857,7 +3857,7 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     return None
 
 
-def _pool_codex_access_token(*, force_refresh: bool = False) -> str:
+def _pool_codex_access_token(*, force_refresh: bool = False, refresh_if_expiring: bool = True) -> str:
     """Return the most-recent usable access_token from the openai-codex pool.
 
     Used as a fallback by ``resolve_codex_runtime_credentials`` when the
@@ -3892,8 +3892,11 @@ def _pool_codex_access_token(*, force_refresh: bool = False) -> str:
         if any(isinstance(e, dict) and e.get("auth_type") == "oauth" for e in entries):
             from agent.credential_pool import load_pool
             pool = load_pool("openai-codex")
-            selected = pool.select()
-            if selected is not None and force_refresh:
+            observed = {e.id: (e.access_token, e.refresh_token) for e in pool.entries()}
+            # Listing/status callers can explicitly disable network refresh.
+            # A forced retry must not proactively refresh and THEN refresh again.
+            selected = pool.select(refresh=refresh_if_expiring and not force_refresh)
+            if selected is not None and force_refresh and observed.get(selected.id) == (selected.access_token, selected.refresh_token):
                 selected = pool.try_refresh_current()
             return str(selected.access_token).strip() if selected else ""
         for entry in entries:
