@@ -316,5 +316,28 @@ def test_failed_durable_write_does_not_expose_rotated_cached_grant(stores, monke
     with pytest.raises(OSError, match="synthetic disk failure"):
         pool.select()
     assert not pool.entries()
-    assert pool.select() is None
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        pool.select()
     assert b"synthetic-next" not in root.read_bytes()
+
+
+def test_cached_status_write_and_selection_preserve_new_root_auth_add(stores):
+    root, profile = stores
+    token = jwt(int(time.time()) + 7200)
+    before = profile.read_bytes()
+    store(root, token=token, rows=[row("old", token=token, source="device_code")])
+    cached = load_pool("openai-codex")
+    cached.select()
+    added = row("new-login", token=jwt(int(time.time()) + 9000), refresh="independent-new")
+    added["source"] = "manual"
+    added["priority"] = 20
+    data = json.loads(root.read_text())
+    data["credential_pool"]["openai-codex"].append(added)
+    root.write_text(json.dumps(data))
+    current = cached.current()
+    assert current is not None
+    cached._mark_exhausted(current, status_code=429)
+    assert {r["id"] for r in json.loads(root.read_text())["credential_pool"]["openai-codex"]} == {"old", "new-login"}
+    selected = cached.select()
+    assert selected is not None and selected.id == "new-login"
+    assert profile.read_bytes() == before

@@ -1451,7 +1451,18 @@ class CredentialPool:
                 if source != self._codex_source_path:
                     raise RuntimeError("Codex credential owner changed; reload the pool")
                 store = auth_mod._codex_source_store()
-                ids = {row.get("id") for row in store.get("credential_pool", {}).get("openai-codex", []) if isinstance(row, dict)}
+                rows = [row for row in store.get("credential_pool", {}).get("openai-codex", []) if isinstance(row, dict)]
+                ids = {row.get("id") for row in rows}
+                known = {e.id for e in self._entries}
+                # Adopt explicit root logins added after this pool was cached;
+                # stale status writes already preserve them at the disk boundary.
+                for row in rows:
+                    if row.get("id") and row["id"] not in known:
+                        added = PooledCredential.from_dict(self.provider, row)
+                        self._entries.append(added)
+                        self._codex_versions[added.id] = (added.access_token, added.refresh_token)
+                _normalize_pool_priorities(self.provider, self._entries)
+                self._entries.sort(key=lambda e: e.priority)
                 singleton = store.get("providers", {}).get("openai-codex") or {}
                 self._entries = [e for e in self._entries if e.id in ids or (e.source == "device_code" and singleton.get("tokens", {}).get("access_token"))]
         now = time.time()
