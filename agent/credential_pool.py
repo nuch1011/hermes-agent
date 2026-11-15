@@ -909,7 +909,7 @@ class CredentialPool:
                 if previous is None:
                     # Compatibility for direct singleton synchronization callers.
                     if entry.source == "device_code":
-                        auth_mod._save_codex_tokens({"access_token": entry.access_token, "refresh_token": entry.refresh_token}, entry.last_refresh, source_path=source)
+                        auth_mod._save_codex_tokens({"access_token": entry.access_token, "refresh_token": entry.refresh_token}, entry.last_refresh, source_path=source, set_active=False)
                     return
                 for row in store.get("credential_pool", {}).get("openai-codex", []):
                     if row.get("auth_type") == AUTH_TYPE_OAUTH and (row.get("id") == entry.id or row.get("refresh_token") == previous.refresh_token):
@@ -1296,7 +1296,7 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "openai-codex", state)
+                                        _store_provider_state(auth_store, "openai-codex", state, set_active=False)
                                         _save_auth_store(auth_store, target_path=source)
                     except Exception as clear_exc:
                         logger.debug(

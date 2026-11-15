@@ -3399,8 +3399,12 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: Optional[str] = None, label: Optional[str] = None, *, source_path: Optional[Path] = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+def _save_codex_tokens(tokens: Dict[str, str], last_refresh: Optional[str] = None, label: Optional[str] = None, *, source_path: Optional[Path] = None, set_active: bool = True) -> None:
+    """Save Codex tokens; only explicit login should activate the provider.
+
+    Runtime refresh/recovery callers pass ``set_active=False`` to preserve the
+    owning store's provider choice, including when borrowing a root login.
+    """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     # Explicit login saves default to LOCAL, even when a root login exists.
@@ -3419,7 +3423,7 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: Optional[str] = Non
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
+        _store_provider_state(auth_store, "openai-codex", state, set_active=set_active)
         _sync_codex_pool_entries(
             auth_store,
             tokens,
@@ -3446,7 +3450,7 @@ def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
     ):
         return None
     logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
-    _save_codex_tokens(imported)
+    _save_codex_tokens(imported, set_active=False)
     return dict(imported)
 
 
@@ -3624,7 +3628,7 @@ def _refresh_codex_auth_tokens(
     updated_tokens["access_token"] = refreshed["access_token"]
     updated_tokens["refresh_token"] = refreshed["refresh_token"]
 
-    _save_codex_tokens(updated_tokens, source_path=_codex_source_path())
+    _save_codex_tokens(updated_tokens, source_path=_codex_source_path(), set_active=False)
     return updated_tokens
 
 
